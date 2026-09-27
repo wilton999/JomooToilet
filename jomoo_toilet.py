@@ -10,11 +10,17 @@
   (默认自动扫描名字以 JOMOO_SMART 开头的设备；多台时选信号最强的)
   (首次连上后会把设备地址记录到脚本目录的 toilet_mac.txt，之后启动直接连它，
    省去扫描；删除该文件即可重新扫描。该文件含你的设备地址，请勿提交到公开仓库)
+  (状态缓存 toilet_state.json 同样只存本地；设置类命令会先取缓存状态、写后校验，
+   必要时自动重试，避免"查询后立即写"导致设置帧被设备忽略)
   (也可用环境变量指定地址: PowerShell 里 $env:JOMOO_MAC = "AA:BB:CC:DD:EE:FF")
   python jomoo_toilet.py scan                  只扫描（列出找到的 JOMOO 设备）
   python jomoo_toilet.py listen [秒]           监听所有通知(默认10秒)
   python jomoo_toilet.py query                 查询马桶状态
-  python jomoo_toilet.py raw [resp] [ffe1|f001] <hex...>   发原始帧
+  python jomoo_toilet.py raw [norsp] [ffe1|f001] <hex...>   发原始帧(默认带响应写)
+  python jomoo_toilet.py multi <命令> [命令...]   一次连接依次执行多条命令
+                             命令可用引号分开或用分号分隔，例:
+                             multi "foot off" "set autocover off" "act cover-close"
+                             (支持 sleep <秒> 控制命令间隔；所有写入默认带响应写)
 
 开关类:
   foot on|off                脚感
@@ -61,8 +67,10 @@
     值: on/off 或数字
 """
 import asyncio
+import json
 import os
 import sys
+import time
 
 DEVICE_NAME_PREFIX = "JOMOO_SMART"
 GOODIX_MANUFACTURER_ID = 0x0211
@@ -85,6 +93,34 @@ def save_cached_mac(mac):
             f.write(mac + "\n")
     except OSError as e:
         print("警告: 无法写入 MAC 记录:", e)
+
+
+STATE_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "toilet_state.json")
+
+
+def load_state_cache():
+    global state_time
+    try:
+        with open(STATE_CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        ts = float(data.pop("ts", 0))
+        state.update({k: v for k, v in data.items() if isinstance(v, (int, float))})
+        state_time = ts
+        print(f"已载入状态缓存（{int(max(0, time.time() - ts))} 秒前）")
+    except (OSError, ValueError):
+        pass
+
+
+def save_state_cache():
+    try:
+        data = dict(state)
+        data["ts"] = state_time
+        with open(STATE_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
 WRITE_UUID = "0000ffe1-0000-1000-8000-00805f9b34fb"
 NOTIFY_UUIDS = [
     "0000ffe1-0000-1000-8000-00805f9b34fb",
@@ -95,6 +131,8 @@ BLE_ADDR = 0x92
 TOILET_ADDR = 0x21
 
 state = {}
+state_seq = 0
+state_time = 0.0
 
 
 def hexs(b):
@@ -135,6 +173,7 @@ def frame_query():
 
 
 def on_notify(sender, data):
+    global state_seq, state_time
     b = bytes(data)
     print("收到通知:", hexs(b))
     if len(b) >= 11 and b[0] == 0xF3 and b[1] == 0xF4 and b[5] == 0xE2:
@@ -148,7 +187,39 @@ def on_notify(sender, data):
             "womanpress": (n >> 4) & 7, "womannozzle": n & 7,
             "cover": 0 if (n >> 7) & 1 else 1, "ring": 0 if (n >> 3) & 1 else 1,
         })
-        print("解析状态:", {k: v for k, v in state.items()})
+        if len(b) >= 13:
+            state["brushtime"] = b[10]
+        state_seq += 1
+        state_time = time.time()
+        save_state_cache()
+        print("解析E2状态:", {k: v for k, v in state.items()})
+    elif len(b) >= 11 and b[0] == 0xF3 and b[1] == 0xF4 and b[5] == 0xFA:
+        upd = {
+            "autoflush": (b[6] >> 1) & 1, "autocover": (b[6] >> 3) & 1,
+            "water": (b[6] >> 4) & 7,
+            "hipnozzle": (b[7] >> 4) & 7, "savepower": (b[7] >> 7) & 1,
+            "seat": b[7] & 7,
+            "smartlight": (b[8] >> 7) & 1, "hippress": (b[8] >> 4) & 7,
+            "air": b[8] & 7,
+            "womannozzle": b[9] & 15, "womanpress": (b[9] >> 4) & 15,
+        }
+        if len(b) >= 11:
+            upd["windspeed"] = (b[10] >> 4) & 7
+        if len(b) >= 12:
+            upd["autotemp"] = (b[11] >> 3) & 1
+            upd["atmo"] = (b[11] >> 4) & 1
+            upd["uv"] = (b[11] >> 5) & 1
+        if len(b) >= 13:
+            upd["bubble"] = (b[12] >> 3) & 1
+            upd["prewet"] = (b[12] >> 5) & 1
+        if len(b) >= 14:
+            upd["foot"] = (b[13] >> 5) & 1
+            ww = b[13] & 7
+            upd["widewash"] = ww if ww >= 1 else 1
+        state.update(upd)
+        state_time = time.time()
+        save_state_cache()
+        print("解析FA状态:", upd)
 
 
 async def scan_jomoo(timeout=8.0):
@@ -267,22 +338,206 @@ ACT_ALIAS = {
 }
 
 
-async def send(client, frame, wait=2.5, uuid=None, resp=False):
+async def send(client, frame, wait=2.5, uuid=None, resp=True):
     print("发送:", hexs(frame))
     await client.write_gatt_char(uuid or WRITE_UUID, frame, response=resp)
     await asyncio.sleep(wait)
 
 
-async def wait_state(client, timeout=4.0):
-    await client.write_gatt_char(WRITE_UUID, frame_query(), response=False)
-    for _ in range(int(timeout * 5)):
-        if state:
-            return True
-        await asyncio.sleep(0.2)
+async def wait_state(client, timeout=3.5, retries=3):
+    """发查询帧并等待"新鲜"的 E2 回复；失败会自动重试。"""
+    global state_seq
+    for attempt in range(1, retries + 1):
+        seen = state_seq
+        await client.write_gatt_char(WRITE_UUID, frame_query(), response=True)
+        waited = 0.0
+        while waited < timeout:
+            if state_seq > seen:
+                return True
+            await asyncio.sleep(0.2)
+            waited += 0.2
+        print(f"未收到 E2 回复（第 {attempt}/{retries} 次查询）")
+        await asyncio.sleep(0.6)
     return False
 
 
+async def ensure_state(client, max_age=600.0):
+    """确保有可用状态。返回 True 表示刚查询过（设备需要安静期）。"""
+    if state and (time.time() - state_time) <= max_age:
+        print(f"使用已缓存状态（{int(time.time() - state_time)} 秒前），不查询设备")
+        return False
+    ok = await wait_state(client)
+    if not ok:
+        print("查询失败；将沿用旧缓存（可能不准确）")
+    return ok
+
+
+async def apply_settings(client, key, expect, attempts=3):
+    """发送 19 字节设置帧并校验，必要时重试。"""
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            print(f"重试设置（第 {attempt}/{attempts} 次）...")
+            await asyncio.sleep(3.0)
+        await send(client, frame_19(25), resp=True, wait=0.3)
+        await asyncio.sleep(2.0)
+        got = await wait_state(client, timeout=3.0, retries=2)
+        cur = state.get(key)
+        if got and cur == expect:
+            print(f"设置生效: {key} = {expect}")
+            return True
+        print(f"第 {attempt} 次未确认生效（当前 {key}={cur}）")
+    print(f"警告: {attempts} 次尝试后仍未确认 {key}={expect}")
+    return False
+
+
+async def run_command(client, argv):
+    """在已连接的 client 上执行一条命令（argv 与命令行参数格式一致）"""
+    global state_time
+    cmd = argv[0].lower()
+
+    if cmd == "listen":
+        secs = float(argv[1]) if len(argv) > 1 else 10.0
+        print(f"监听 {secs:.0f} 秒...")
+        await asyncio.sleep(secs)
+        return
+
+    if cmd == "sleep":
+        secs = float(argv[1]) if len(argv) > 1 else 1.0
+        print(f"等待 {secs:.1f} 秒...")
+        await asyncio.sleep(secs)
+        return
+
+    if cmd == "query":
+        if await wait_state(client):
+            print("当前状态:", {k: v for k, v in state.items()})
+        return
+
+    if cmd == "raw":
+        args = argv[1:]
+        uuid = None
+        resp = True
+        while args and args[0].lower() in ("ffe1", "f001", "resp", "norsp"):
+            a0 = args[0].lower()
+            if a0 == "f001":
+                uuid = "0000f001-0000-1000-8000-00805f9b34fb"
+            elif a0 == "resp":
+                resp = True
+            elif a0 == "norsp":
+                resp = False
+            args = args[1:]
+        if not args:
+            print("用法: raw [resp] [ffe1|f001] F3 F4 06 92 21 1F 24 01 FD FC")
+            return
+        data = bytes(int(x, 16) for x in args)
+        await send(client, data, uuid=uuid, resp=resp)
+        return
+
+    arg2 = argv[1].lower() if len(argv) > 1 else ""
+
+    if cmd == "atmo-mode":
+        mode = int(argv[1]) if len(argv) > 1 else 0
+        await send(client, frame_1f(51, 32 | (mode & 15)))
+        return
+    if cmd == "dist":
+        await send(client, frame_1f(18, int(argv[1]) & 0xFF))
+        return
+    if cmd == "bright":
+        await send(client, frame_1f(42, int(argv[1]) & 0xFF))
+        return
+    if cmd == "strongdry":
+        val = int(argv[1]) if len(argv) > 1 else 0x18
+        await send(client, frame_1f(34, val & 0xFF))
+        return
+    if cmd == "brushtime":
+        await send(client, frame_1f(32, 128, int(argv[1]) & 0xFF))
+        return
+    if cmd == "sens":
+        if arg2 == "0":
+            await send(client, frame_1f(17, 0))
+        else:
+            await send(client, frame_1f(16, 0))
+        return
+    if cmd == "redblue":
+        mode = int(argv[1]) if len(argv) > 1 else 0
+        red = int(argv[2]) if len(argv) > 2 else 0
+        blue = int(argv[3]) if len(argv) > 3 else 0
+        await send(client, frame_1f(53, mode, red, blue))
+        return
+
+    if cmd == "selfclean" and arg2 == "off":
+        cmd = "act"
+        argv = ["act", "0"]
+    if cmd == "nozzledry" and arg2 == "off":
+        cmd = "act"
+        argv = ["act", "0"]
+
+    if cmd == "set":
+        if len(argv) < 3 or argv[1] not in SET_KEYS:
+            print("用法: set <键> <值>，键可选:", " ".join(SET_KEYS))
+            return
+        key, val = argv[1], argv[2].lower()
+        if val in ("on", "1", "open"):
+            num = 1
+        elif val in ("off", "0", "close"):
+            num = 0
+        else:
+            num = int(val)
+        if num > SET_KEYS[key] or num < 0:
+            print(f"值范围 0-{SET_KEYS[key]}")
+            return
+        fresh = await ensure_state(client)
+        if fresh:
+            print("等待设备安静（查询后约 3 秒）...")
+            await asyncio.sleep(3.0)
+        state[key] = num
+        if await apply_settings(client, key, num):
+            state_time = time.time()
+            save_state_cache()
+        return
+
+    if cmd == "act":
+        if len(argv) < 2:
+            print("用法: act <码或简写>，简写:", " ".join(ACT_ALIAS))
+            return
+        arg = argv[1].lower()
+        code = ACT_ALIAS.get(arg)
+        if code is None:
+            code = int(arg, 0)
+        fresh = await ensure_state(client)
+        if fresh:
+            print("等待设备安静（查询后约 3 秒）...")
+            await asyncio.sleep(3.0)
+        await send(client, frame_19(code), resp=True)
+        return
+
+    frame = SIMPLE.get(tuple(a.lower() for a in argv))
+    if frame is None:
+        print("未知命令，看帮助: python jomoo_toilet.py help")
+        return
+    await send(client, frame())
+
+
+async def run_multi(client, items):
+    lines = []
+    for item in items:
+        lines.extend(p.strip() for p in item.split(";"))
+    lines = [x for x in lines if x]
+    if not lines:
+        print('用法: multi "命令1" "命令2" ...')
+        print('例如: python jomoo_toilet.py multi "foot off" "set autocover off" "act cover-close"')
+        return
+    print(f"批量执行 {len(lines)} 条命令（共用一次连接）")
+    for i, line in enumerate(lines, 1):
+        print(f"--- [{i}/{len(lines)}] {line}")
+        try:
+            await run_command(client, line.split())
+        except Exception as e:
+            print(f"命令出错: {line} -> {e!r}")
+    print("批量执行结束")
+
+
 async def main():
+    load_state_cache()
     argv = sys.argv[1:]
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(__doc__)
@@ -320,118 +575,11 @@ async def main():
             except Exception:
                 pass
 
-        if cmd == "listen":
-            secs = float(argv[1]) if len(argv) > 1 else 10.0
-            print(f"监听 {secs:.0f} 秒...")
-            await asyncio.sleep(secs)
+        if cmd in ("multi", "batch"):
+            await run_multi(client, argv[1:])
             return
 
-        if cmd == "query":
-            await client.write_gatt_char(WRITE_UUID, frame_query(), response=False)
-            await asyncio.sleep(2.5)
-            if not state:
-                print("未收到状态回复")
-            return
-
-        if cmd == "raw":
-            args = argv[1:]
-            uuid = None
-            resp = False
-            while args and args[0].lower() in ("ffe1", "f001", "resp", "norsp"):
-                a0 = args[0].lower()
-                if a0 == "f001":
-                    uuid = "0000f001-0000-1000-8000-00805f9b34fb"
-                elif a0 == "resp":
-                    resp = True
-                elif a0 == "norsp":
-                    resp = False
-                args = args[1:]
-            if not args:
-                print("用法: raw [resp] [ffe1|f001] F3 F4 06 92 21 1F 24 01 FD FC")
-                return
-            data = bytes(int(x, 16) for x in args)
-            await send(client, data, uuid=uuid, resp=resp)
-            return
-
-        arg2 = argv[1].lower() if len(argv) > 1 else ""
-
-        if cmd == "atmo-mode":
-            mode = int(argv[1]) if len(argv) > 1 else 0
-            await send(client, frame_1f(51, 32 | (mode & 15)))
-            return
-        if cmd == "dist":
-            await send(client, frame_1f(18, int(argv[1]) & 0xFF))
-            return
-        if cmd == "bright":
-            await send(client, frame_1f(42, int(argv[1]) & 0xFF))
-            return
-        if cmd == "strongdry":
-            val = int(argv[1]) if len(argv) > 1 else 0x18
-            await send(client, frame_1f(34, val & 0xFF))
-            return
-        if cmd == "brushtime":
-            await send(client, frame_1f(32, 128, int(argv[1]) & 0xFF))
-            return
-        if cmd == "sens":
-            if arg2 == "0":
-                await send(client, frame_1f(17, 0))
-            else:
-                await send(client, frame_1f(16, 0))
-            return
-        if cmd == "redblue":
-            mode = int(argv[1]) if len(argv) > 1 else 0
-            red = int(argv[2]) if len(argv) > 2 else 0
-            blue = int(argv[3]) if len(argv) > 3 else 0
-            await send(client, frame_1f(53, mode, red, blue))
-            return
-
-        if cmd == "selfclean" and arg2 == "off":
-            cmd = "act"
-            argv = ["act", "0"]
-        if cmd == "nozzledry" and arg2 == "off":
-            cmd = "act"
-            argv = ["act", "0"]
-
-        if cmd == "set":
-            if len(argv) < 3 or argv[1] not in SET_KEYS:
-                print("用法: set <键> <值>，键可选:", " ".join(SET_KEYS))
-                return
-            key, val = argv[1], argv[2].lower()
-            if val in ("on", "1", "open"):
-                num = 1
-            elif val in ("off", "0", "close"):
-                num = 0
-            else:
-                num = int(val)
-            if num > SET_KEYS[key] or num < 0:
-                print(f"值范围 0-{SET_KEYS[key]}")
-                return
-            if not await wait_state(client):
-                print("未获取到马桶状态，未发送（防止覆盖其他设置）")
-                return
-            state[key] = num
-            await send(client, frame_19(25))
-            return
-
-        if cmd == "act":
-            if len(argv) < 2:
-                print("用法: act <码或简写>，简写:", " ".join(ACT_ALIAS))
-                return
-            arg = argv[1].lower()
-            code = ACT_ALIAS.get(arg)
-            if code is None:
-                code = int(arg, 0)
-            if not await wait_state(client):
-                print("未获取到马桶状态，未发送（动作帧带设置位，防止覆盖设置）")
-                return
-            await send(client, frame_19(code))
-            return
-
-        frame = SIMPLE.get(tuple(a.lower() for a in argv))
-        if frame is None:
-            print("未知命令，看帮助: python jomoo_toilet.py help")
-            return
-        await send(client, frame())
+        await run_command(client, argv)
 
 
 if __name__ == "__main__":

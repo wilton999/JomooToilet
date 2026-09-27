@@ -14,7 +14,8 @@
 python jomoo_toilet.py scan                   # 扫描附近的 JOMOO 马桶
 python jomoo_toilet.py query                  # 读取马桶当前设置
 python jomoo_toilet.py listen [秒]            # 监听所有通知（默认10秒）
-python jomoo_toilet.py raw [resp] [ffe1|f001] <hex...>   # 发送任意原始帧
+python jomoo_toilet.py raw [norsp] [ffe1|f001] <hex...>   # 发送任意原始帧（默认带响应写）
+python jomoo_toilet.py multi "foot off" "set autocover off"   # 一次连接依次执行多条命令
 
 # 开关类
 python jomoo_toilet.py foot on/off            # 脚感控制
@@ -41,14 +42,14 @@ python jomoo_toilet.py brushtime <数值>       # 刷圈发泡时间档
 python jomoo_toilet.py redblue <模式> <红> <蓝>   # 红蓝光
 python jomoo_toilet.py liftclean / liquidbox / forceflush / unblock
 
-# 动作（自动先读状态，防止覆盖其他设置）
+# 动作（优先用本地状态缓存，防止覆盖其他设置；写入后自动校验）
 python jomoo_toilet.py act bigflush           # 大冲
 python jomoo_toilet.py act flush-small        # 小冲
 python jomoo_toilet.py act cover-open / cover-close / cover-openring
 python jomoo_toilet.py act wash-hip / wash-woman / wash-auto-hip / wash-auto-woman
 python jomoo_toilet.py act dry / defecate / sitz / nozzle-clean / deodorize / autotemp / stop
 
-# 设置（自动先读状态，只改指定项）
+# 设置（优先用本地状态缓存，只改指定项；写入后自动校验、失败自动重试）
 python jomoo_toilet.py set autoflush on       # 自动冲刷
 python jomoo_toilet.py set autocover on       # 自动翻盖
 python jomoo_toilet.py set seat 2             # 座温（0-15）；water 水温；air 风温
@@ -80,6 +81,53 @@ $env:JOMOO_MAC = "AA:BB:CC:DD:EE:FF"
 
 ---
 
+## 一次执行多条命令（multi）
+
+每次运行都重新扫描/连接设备比较慢，用 `multi` 可以在**同一次蓝牙连接**里依次执行多条命令：
+
+```powershell
+python jomoo_toilet.py multi "foot off" "set autocover off" "bright 2"
+python jomoo_toilet.py multi "foot off; set autocover off"   # 等价的写法
+```
+
+* 每个带引号的参数算一条命令；一个参数里也可以用 `;` 分隔多条。
+* 命令按顺序执行；某条出错（例如写错命令）只会打印提示，不影响后续命令。
+* `set` / `act` 优先使用本地状态缓存 `toilet_state.json`（收到 E2/FA 状态帧时自动更新），
+  无需每次查询；确实需要时才查询，并在写入后校验、失败自动重试（最多 3 次）。
+* 支持 `sleep <秒>` 命令控制两条命令之间的间隔，例如
+  `multi "query" "sleep 3" "set autocover off"`。
+* `multi` 也可以写成 `batch`。
+
+---
+
+## 定时任务（例如每天定时开关脚感）
+
+Windows 下提供 `setup_schedule.ps1`，可一键注册/删除两个计划任务：
+每天 `21:00` 关闭脚感（`foot off`），`23:00` 打开脚感（`foot on`）。
+
+```powershell
+# 安装（默认 21:00 关、23:00 开）
+powershell -ExecutionPolicy Bypass -File .\setup_schedule.ps1
+
+# 自定义时间与命令（例如晚上关脚感+关自动翻盖，早上恢复）
+powershell -ExecutionPolicy Bypass -File .\setup_schedule.ps1 -OffTime 22:00 -OnTime 07:00 `
+  -OffCommand 'multi "foot off" "set autocover off"' -OnCommand 'multi "foot on" "set autocover on"'
+
+# 删除任务
+powershell -ExecutionPolicy Bypass -File .\setup_schedule.ps1 -Remove
+```
+
+说明：
+
+* 默认两个任务分别是 `foot off` / `foot on`，可用 `-OffCommand` / `-OnCommand`
+  改成任意命令（多条命令用 `multi`，见上节）。
+* 任务以当前用户身份运行，仅在用户登录时执行（BLE 需要用户会话）。
+* 通过 `pythonw` + `run_silent.pyw` 静默运行，不会弹出黑色控制台窗口。
+* 电脑睡眠时会唤醒执行；错过的时间点会在开机后自动补跑。
+* 每次运行日志追加到 `logs\foot_off.log` / `logs\foot_on.log`，连不上马桶时可在其中查看原因。
+
+---
+
 ## 协议摘要
 
 1. 该控制器使用的蓝牙服务：
@@ -97,8 +145,14 @@ $env:JOMOO_MAC = "AA:BB:CC:DD:EE:FF"
    
    校验算法：从长度字节起、到校验位前（不含）的所有字节求和，取低 8 位。
 
-3. 设置类命令会先发送查询帧（`E2`）读取当前状态，按位修改目标项后发送，
-   避免把其他设置覆盖为默认值。
+3. 可靠性设计（已实测验证）：
+   * 所有写入都使用**带响应写**（Write Request），与小程序行为一致；
+     用无响应写发送 19 字节设置帧会被设备忽略。
+   * 设备在刚回复状态查询（E2）后的短时间内会忽略设置帧；因此工具在必须
+     查询的情况下会先等待约 3 秒再发送。
+   * 设置类命令优先使用本地状态缓存 `toilet_state.json`（每次收到 E2/FA
+     状态帧自动更新），据此按位修改，避免覆盖其他设置。
+   * 设置帧发送后会自动查询校验，未生效则自动重发（最多 3 次）。
 
 4. 马桶通常会对命令回发状态帧（`FA`/`E7`/`E9` 等），工具会打印出来供确认。
 
