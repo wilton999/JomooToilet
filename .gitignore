@@ -1,0 +1,6 @@
+# 本地私密文件：包含你的设备蓝牙地址，请勿提交
+toilet_mac.txt
+
+# Python 缓存
+__pycache__/
+*.pyc
